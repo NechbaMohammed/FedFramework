@@ -1,0 +1,9 @@
+flwr[simulation]==1.16.0
+omegaconf
+torch 
+torchvision
+datasets
+hydra-core
+scikit-learn
+matplotlib
+seaborn
