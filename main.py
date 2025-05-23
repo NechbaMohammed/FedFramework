@@ -1,17 +1,10 @@
 import os
 import csv
 import argparse
-import logging
 from omegaconf import OmegaConf
 import torch
-import flwr as fl
 from fedml.algorithms.scaffold.simulation import run_scaffold
-from fedml.algorithms.tamuna.simulation import run_tamuna
 
-# Configuration du logging pour réduire les messages inutiles
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("flwr").setLevel(logging.WARNING)  # Réduit les logs de Flower
-logging.getLogger("ray").setLevel(logging.WARNING)  # Réduit les logs de Ray
 
 def main():
     parser = argparse.ArgumentParser(description="Run Federated Averaging Simulations")
@@ -26,7 +19,7 @@ def main():
                         help="Number of clients")
     parser.add_argument("--rounds", type=int, default=1,
                         help="Number of federation rounds")
-    parser.add_argument("--epochs", type=int, nargs="+",
+    parser.add_argument("--epochs", type=int,nargs="+",
                         help="Number of local epochs")
     parser.add_argument("--runs", type=int, default=3,
                         help="Number of independent runs")
@@ -52,12 +45,10 @@ def main():
                         help="Number of GPUs per client")
     
     args = parser.parse_args()
-
-    # Validation de la méthode
-    if args.method not in ["scaffold", "tamuna"]:
+    if args.method not in ["scaffold"]:  # Add more methods as needed
         raise ValueError("Invalid method")
 
-    # Validation des paramètres spécifiques à la partition
+    # Validate partition-specific parameters
     if args.partitioning == "label_quantity" and not args.labels_per_client:
         raise ValueError("--labels_per_client required for label_quantity partitioning")
     if args.partitioning == "dirichlet" and not args.alpha:
@@ -66,11 +57,12 @@ def main():
         raise ValueError("--similarity required for iid_noniid partitioning")
     if args.partitioning == "noise" and not args.segma:
         raise ValueError("--segma required for noise partitioning")
-
-    # Configuration du modèle
-    if args.dataset in ["mnist", "fmnist"]:
+    # epochs validation
+    
+    # Model configuration
+    if args.dataset == "mnist" or args.dataset == "fmnist":
         model_cfg = OmegaConf.create({
-            "_target_": "fedml.models.MNISTModel",
+            "_target_": "fedml.models.MNISTModel" ,
             "input_dim": 256,
             "hidden_dims": [120, 84],
             "num_classes": 10,
@@ -83,13 +75,13 @@ def main():
             "num_classes": 10,
         })
 
-    # Configuration du backend
+    # Backend configuration
     backend_config = {
-        "num_cpus": 4,
-        "num_gpus": 0,
+        "num_cpus": args.num_cpus,
+        "num_gpus": args.num_gpus,
     }
 
-    # Combinaisons de paramètres à traiter
+    # Parameter combinations to process
     param_combinations = [{}]
     if args.partitioning == "label_quantity":
         param_combinations = [{"labels_per_client": c} for c in args.labels_per_client]
@@ -102,14 +94,14 @@ def main():
         epochs = [int(e) for e in args.epochs]
 
     for params in param_combinations:
-        # Création de la configuration des données
+        # Create data configuration
         data_config = {
             "name": args.dataset,
             "partitioning": args.partitioning,
             "batch_size": args.batch_size,
         }
 
-        # Ajout des paramètres spécifiques à la partition
+        # Add partition-specific parameters
         if args.partitioning == "label_quantity":
             data_config["labels_per_client"] = params["labels_per_client"]
         elif args.partitioning == "dirichlet":
@@ -121,7 +113,7 @@ def main():
 
         data_config = OmegaConf.create(data_config)
 
-        # Création du répertoire de résultats
+        # Create results directory
         results_dir = os.path.join(
             "results",
             "experiments",
@@ -132,14 +124,14 @@ def main():
         )
         os.makedirs(results_dir, exist_ok=True)
 
-        # Exécution des simulations indépendantes
+        # Run multiple independent simulations
         for epoch in epochs:
             for run in range(1, args.runs + 1):
                 print(f"\n▶︎ {args.partitioning.upper()} Simulation")
                 print(f" - Parameters: {params}")
                 print(f" - Num epochs: {epoch}")
                 print(f" - Run {run}/{args.runs}")
-                model_dir = f"results/weights/{args.method}/{args.dataset}/{args.partitioning}/epoch{epoch}"
+                model_dir=f"results/weights/{args.method}/{args.dataset}/{args.partitioning}/epoch{epoch}"
                 if args.partitioning == "label_quantity":
                     model_dir += f"/C{params['labels_per_client']}"
                 elif args.partitioning == "dirichlet":
@@ -147,25 +139,18 @@ def main():
                 print(model_dir)
                 model_dir += f"/run{run}"
                 
-                if args.method == "tamuna":
-                    history_tuple = run_tamuna(
+                history = run_scaffold(
                         data_config=data_config,
                         model_cfg=model_cfg,
                         backend_config=backend_config,
                         num_clients=args.num_clients,
                         num_rounds=args.rounds,
                         num_epochs=epoch,
-                        learning_rate=args.learning_rate,
+                        learning_rate= args.learning_rate,
                         model_dir=model_dir,
-                        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                        fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
-                        evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn
-                    )
-                    history = history_tuple[0]  # Extraire l'objet History du tuple
-                else:
-                    raise ValueError("Méthode non supportée après suppression de scaffold")
-
-                # Sauvegarde des résultats
+                        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+                
+                # Process and save results
                 _save_results(
                     history=history,
                     results_dir=results_dir,
@@ -197,71 +182,21 @@ def _get_partition_subdir(partitioning, params):
 
 def _save_results(history, results_dir, params, rounds, epochs, run):
     """Save simulation results to CSV file."""
+    centralized_metrics = history.metrics_centralized
+    accuracies = [round(value, 4) for _, value in centralized_metrics["test_accuracy"]]
     rounds_list = list(range(0, rounds + 1))
+
+    # Generate filename components
     param_str = "_".join([f"{k}{v}" for k, v in params.items()])
     filename = f"rounds{rounds}_epochs{epochs}_{param_str}_run{run}.csv"
 
-    # Initialiser les listes pour les métriques
-    test_accuracies = [0.0] * (rounds + 1)
-    centralized_losses = [0.0] * (rounds + 1)
-    distributed_losses = [0.0] * (rounds + 1)
-    distributed_eval_accuracies = [0.0] * (rounds + 1)
-
-    # Extraire les métriques centralisées
-    if hasattr(history, 'metrics_centralized') and history.metrics_centralized:
-        centralized_metrics = history.metrics_centralized
-        test_accuracy_data = centralized_metrics.get("test_accuracy", [])
-        for round_num, value in test_accuracy_data:
-            if round_num < len(test_accuracies):
-                test_accuracies[round_num] = round(value, 4)
-
-    # Extraire les pertes centralisées
-    if hasattr(history, 'losses_centralized') and history.losses_centralized:  # Changement ici
-        for round_num, value in history.losses_centralized:  # Itération directe sur la liste de tuples
-            if round_num < len(centralized_losses):
-                centralized_losses[round_num] = round(value, 4)
-    else:
-        print("Aucune perte centralisée disponible.")
-
-    # Extraire les pertes distribuées
-    if hasattr(history, 'losses_distributed') and history.losses_distributed:  # Changement ici
-        for round_num, value in history.losses_distributed:  # Itération directe sur la liste de tuples
-            if round_num < len(distributed_losses):
-                distributed_losses[round_num] = round(value, 4)
-    else:
-        print("Aucune perte distribuée disponible.")
-
-    # Extraire les métriques distribuées (évaluation)
-    if hasattr(history, 'metrics_distributed') and history.metrics_distributed:
-        distributed_metrics = history.metrics_distributed
-        eval_accuracy_data = distributed_metrics.get("accuracy", [])
-        for round_num, value in eval_accuracy_data:
-            if round_num < len(distributed_eval_accuracies):
-                distributed_eval_accuracies[round_num] = round(value, 4)
-
-    # Écrire dans le CSV
+    # Write to CSV
     with open(os.path.join(results_dir, filename), "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Round", "Test_Accuracy", "Centralized_Loss", "Distributed_Loss", "Distributed_Evaluate_Accuracy"])
-        writer.writerows(zip(rounds_list, test_accuracies, centralized_losses, distributed_losses, distributed_eval_accuracies))
-    
-    print(f"Results saved to {os.path.join(results_dir, filename)}")
-    
-    
-    
-def fit_metrics_aggregation_fn(fit_metrics):
-    """Aggregate client metrics during the fit phase."""
-    if not fit_metrics:
-        return {}
-    total_accuracy = sum(metrics.get("accuracy", 0.0) for _, metrics in fit_metrics)
-    return {"accuracy": total_accuracy / len(fit_metrics)}
+        writer.writerow(["Round", "Accuracy"])
+        writer.writerows(zip(rounds_list, accuracies))
 
-def evaluate_metrics_aggregation_fn(evaluate_metrics):
-    """Aggregate client metrics during the evaluate phase."""
-    if not evaluate_metrics:
-        return {}
-    total_accuracy = sum(metrics.get("accuracy", 0.0) for _, metrics in evaluate_metrics)
-    return {"accuracy": total_accuracy / len(evaluate_metrics)}
+    print(f"Results saved to {os.path.join(results_dir, filename)}")
 
 if __name__ == "__main__":
     main()
